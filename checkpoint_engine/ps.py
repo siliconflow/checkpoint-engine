@@ -25,7 +25,7 @@ from checkpoint_engine.data_types import (
 )
 from checkpoint_engine.device_utils import DeviceManager, get_ip, npu_generate_uuid
 from checkpoint_engine.p2p_store import P2PStore
-from checkpoint_engine.pin_memory import _ALIGN_SIZE, _register_checkpoint
+from checkpoint_engine.pin_memory import _ALIGN_SIZE, _register_checkpoint, _register_checkpoint_with_packed_infos
 
 
 if TYPE_CHECKING:
@@ -64,26 +64,35 @@ def _gen_h2d_buckets(
     local_topo: dict[str, set[int]],
     remote_topo: dict[str, set[int]],
     ranks: list[int] | None = None,
+    buffer_granularity: bool = False,
 ) -> list[tuple[int, int, H2DBucket]]:
     buckets: list[tuple[int, H2DBucket]] = []
 
     for owner_rank, items in global_metas.items():
         buckets.append((owner_rank, H2DBucket(size=0, ranges=[], items=[])))
         for idx, metas in enumerate(items.memory_buffer_metas_list):
-            start_offset, offset = 0, 0
-            for meta in metas.metas:
-                s = meta.aligned_size
-                if buckets[-1][1].size + s > bucket_size:
-                    if offset - start_offset > 0:
-                        buckets[-1][1].ranges.append(
-                            BucketRange(idx, start_offset, offset - start_offset)
-                        )
-                    start_offset = offset
+            if buffer_granularity:
+                curr_buff_size = metas.size
+                if buckets[-1][1].size + curr_buff_size > bucket_size:
                     buckets.append((owner_rank, H2DBucket(size=0, ranges=[], items=[])))
-                offset += s
-                buckets[-1][1].size += s
-                buckets[-1][1].items.append(meta)
-            buckets[-1][1].ranges.append(BucketRange(idx, start_offset, offset - start_offset))
+                buckets[-1][1].size += curr_buff_size
+                buckets[-1][1].ranges.append(BucketRange(idx, 0, curr_buff_size))
+                buckets[-1][1].items.extend(metas.metas)
+            else:
+                start_offset, offset = 0, 0
+                for meta in metas.metas:
+                    s = meta.aligned_size
+                    if buckets[-1][1].size + s > bucket_size:
+                        if offset - start_offset > 0:
+                            buckets[-1][1].ranges.append(
+                                BucketRange(idx, start_offset, offset - start_offset)
+                            )
+                        start_offset = offset
+                        buckets.append((owner_rank, H2DBucket(size=0, ranges=[], items=[])))
+                    offset += s
+                    buckets[-1][1].size += s
+                    buckets[-1][1].items.append(meta)
+                buckets[-1][1].ranges.append(BucketRange(idx, start_offset, offset - start_offset))
         assert buckets[-1][1].size > 0, (
             f"buckets[-1][1].size {buckets[-1][1].size} should be greater than 0"
         )
@@ -96,7 +105,6 @@ def _gen_h2d_buckets(
         return [(owner_rank, owner_rank, bucket) for owner_rank, bucket in buckets]
     else:
         return _assign_receiver_ranks(buckets, actual_local_topo, remote_topo)
-
 
 def _assign_receiver_ranks(
     buckets: list[tuple[int, "T"]],
@@ -279,6 +287,7 @@ class ParameterServer:
         named_tensors: dict[str, torch.Tensor] | None = None,
         use_shared_memory_pool: bool = False,
         use_inplace_pin_memory: bool = True,
+        packaged_infos: dict[int, dict[str, list[str]]] | None = None,
     ) -> None:
         """
         Register a checkpoint to the parameter server. Both files and named_tensors will be registered together.
@@ -315,13 +324,23 @@ class ParameterServer:
                 # Since we set the uninitialized shared memory pool to empty list,
                 # we can check whether this is the first time to use shared memory pool
                 _is_first_time = not self._memory_pool[self.shared_memory_pool_name]
-                self._memory_pool[self.shared_memory_pool_name] = _register_checkpoint(
-                    files=files or [],
-                    named_tensors=named_tensors or {},
-                    rank=self._rank,
-                    shared_pin_memory=self._memory_pool[self.shared_memory_pool_name],
-                    inplace_pin=False,  # inplace pin memory is not compatible with shared memory pool
-                )
+                if packaged_infos is None:
+                    self._memory_pool[self.shared_memory_pool_name] = _register_checkpoint(
+                        files=files or [],
+                        named_tensors=named_tensors or {},
+                        rank=self._rank,
+                        shared_pin_memory=self._memory_pool[self.shared_memory_pool_name],
+                        inplace_pin=False,  # inplace pin memory is not compatible with shared memory pool
+                    )
+                else:
+                    self._memory_pool[self.shared_memory_pool_name] = _register_checkpoint_with_packed_infos(
+                        files=files or [],
+                        named_tensors=named_tensors or {},
+                        rank=self._rank,
+                        shared_pin_memory=self._memory_pool[self.shared_memory_pool_name],
+                        inplace_pin=False,  # inplace pin memory is not compatible with shared memory pool
+                        packaged_infos=packaged_infos,
+                    )
                 self._current_shared_memory_pool_user = checkpoint_name
                 if self._p2p_store is not None and _is_first_time:
                     self._register_parameters_to_p2p_store(checkpoint_name)
@@ -329,12 +348,21 @@ class ParameterServer:
                 assert checkpoint_name not in self._memory_pool, (
                     f"checkpoint {checkpoint_name} already registered"
                 )
-                self._memory_pool[checkpoint_name] = _register_checkpoint(
-                    files=files or [],
-                    named_tensors=named_tensors or {},
-                    rank=self._rank,
-                    inplace_pin=use_inplace_pin_memory,
-                )
+                if packaged_infos is None:
+                    self._memory_pool[checkpoint_name] = _register_checkpoint(
+                        files=files or [],
+                        named_tensors=named_tensors or {},
+                        rank=self._rank,
+                        inplace_pin=use_inplace_pin_memory,
+                    )
+                else:
+                    self._memory_pool[checkpoint_name] = _register_checkpoint_with_packed_infos(
+                        files=files or [],
+                        named_tensors=named_tensors or {},
+                        rank=self._rank,
+                        inplace_pin=use_inplace_pin_memory,
+                        packaged_infos=packaged_infos,
+                    )
                 if self._p2p_store is not None:
                     self._register_parameters_to_p2p_store(checkpoint_name)
         except Exception:
@@ -548,6 +576,7 @@ class ParameterServer:
         *,
         timeout: timedelta = timedelta(minutes=10),
         ranks: list[int] | None = None,
+        buffer_granularity: bool = False,
     ) -> None:
         """
         Update the checkpoint to inference engine. This function should be called after gather_metas.
@@ -572,7 +601,7 @@ class ParameterServer:
                 self.init_process_group(timeout=timeout)
             # if ranks is None or [], it will use fully broadcast to update to all ranks
             ranks_group = dist.new_group(ranks) if ranks else None
-            self._update_per_bucket(checkpoint_name, req_func, ranks_group, ranks)
+            self._update_per_bucket(checkpoint_name, req_func, ranks_group, ranks, buffer_granularity)
             self.store_based_barrier()
         except Exception as e:
             logger.exception(
@@ -606,6 +635,7 @@ class ParameterServer:
         ranks_group: dist.DistributedProcessGroup | None,
         *,
         disable_h2d_buffer: bool = False,
+        buffer_granularity: bool = False,
     ) -> tuple[int, bool]:
         GiB = 1 << 30  # noqa: N806
         # auto detect bucket size
@@ -628,8 +658,11 @@ class ParameterServer:
         max_tensor_bytes = 0
         for items in self._current_global_parameter_metas.values():
             for metas_list in items.memory_buffer_metas_list:
-                for meta in metas_list.metas:
-                    max_tensor_bytes = max(max_tensor_bytes, meta.aligned_size)
+                if buffer_granularity:
+                    max_tensor_bytes = max(max_tensor_bytes, metas_list.size)
+                else:
+                    for meta in metas_list.metas:
+                        max_tensor_bytes = max(max_tensor_bytes, meta.aligned_size)
         free_bytes_divided_3 = free_bytes // (3 * _ALIGN_SIZE) * _ALIGN_SIZE
         if max_tensor_bytes <= free_bytes_divided_3 and not disable_h2d_buffer:
             self._logger_rank0(f"[rank{self._rank}] use h2d buffer")
@@ -726,6 +759,7 @@ class ParameterServer:
         req_func: Callable[[list[tuple[str, str]]], None],
         ranks_group: dist.DistributedProcessGroup | None,
         ranks: list[int] | None = None,
+        buffer_granularity: bool = False,
     ):
         assert len(self._current_global_parameter_metas) != 0, "parameter metas is empty"
         assert dist.is_initialized(), "process group is not initialized"
@@ -751,13 +785,14 @@ class ParameterServer:
             # first execute a barrier to avoid subsequent device oom
             dist.barrier(group=ranks_group)
 
-        bucket_size, disable_h2d_buffer = self._detect_bucket_size(ranks_group)
+        bucket_size, disable_h2d_buffer = self._detect_bucket_size(ranks_group, buffer_granularity=buffer_granularity)
         buckets = _gen_h2d_buckets(
             self._current_global_parameter_metas,
             bucket_size,
             self._local_rdma_devices,
             self._remote_rdma_devices,
             ranks,
+            buffer_granularity=buffer_granularity,
         )
 
         h2d_buffer: torch.Tensor | None = (
